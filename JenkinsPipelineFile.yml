@@ -1,0 +1,170 @@
+pipeline {
+    agent any
+    tools {
+        "org.jenkinsci.plugins.terraform.TerraformInstallation" "terraform"
+    }
+    environment {
+        TF_HOME = tool('terraform')
+        TF_IN_AUTOMATION = "true"
+        PATH = "$TF_HOME:$PATH"
+        registrycredential = "ACR"
+        azureserviceprincipal = "azsp"
+        dockerImage = ''
+        BUILDNUMBER = ''
+    }
+    stages {
+        
+        stage('checkout') {
+            steps {
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/shashikanthvnmmattapalli/infra_terraform.git']])
+                
+            }
+        }
+        stage('Terraform Init'){
+            
+            steps {
+                    ansiColor('xterm') {
+                    withCredentials([azureServicePrincipal(
+                    credentialsId: 'azsp',
+                    subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
+                    clientIdVariable: 'ARM_CLIENT_ID',
+                    clientSecretVariable: 'ARM_CLIENT_SECRET',
+                    tenantIdVariable: 'ARM_TENANT_ID'
+                ), string(credentialsId: 'AzureStorageAccountkey', variable: 'str')]) {
+                
+                        sh """
+                                
+                        echo "Initialising Terraform"
+                        terraform init -backend-config="access_key=$str"
+                        """
+                           }
+                    }
+             }
+        }
+        stage('Terraform Plan'){
+            steps {
+
+                    ansiColor('xterm') {
+                    withCredentials([azureServicePrincipal(
+                    credentialsId: 'azsp',
+                    subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
+                    clientIdVariable: 'ARM_CLIENT_ID',
+                    clientSecretVariable: 'ARM_CLIENT_SECRET',
+                    tenantIdVariable: 'ARM_TENANT_ID'
+                ), string(credentialsId: 'AzureStorageAccountkey', variable: '$str')]) {
+                        
+                        sh """
+                        
+                        echo "Creating Terraform Plan"
+                        terraform plan
+                        """
+                        }
+                }
+            }
+        }
+        
+        stage('Waiting for Approval'){
+            steps {
+                    input (message: "Deploy the infrastructure?")
+            }
+        
+        }
+        
+        stage('Terraform apply'){
+            steps {
+
+                    ansiColor('xterm') {
+                    withCredentials([azureServicePrincipal(
+                    credentialsId: 'azsp',
+                    subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
+                    clientIdVariable: 'ARM_CLIENT_ID',
+                    clientSecretVariable: 'ARM_CLIENT_SECRET',
+                    tenantIdVariable: 'ARM_TENANT_ID'
+                ), string(credentialsId: 'AzureStorageAccountkey', variable: '$str')]) {
+                        
+                        sh """
+                        
+                        echo "Applying Terraform Plan"
+                        terraform apply -auto-approve
+                        """
+                        }
+                }
+            }
+        }
+        stage('Waiting for Approval to build the code'){
+            steps {
+                    input (message: "Infra setup is done, build and deploy the code ")
+            }
+        
+        }
+        
+        stage('checkout to code') {
+            steps {
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/shashikanthvnmmattapalli/aksnodejs.git']])
+            }
+        }
+        
+        stage('Build Image'){
+            steps{
+                withCredentials([string(credentialsId: 'Registryname', variable: 'acrregistryname')]) {
+                    script{
+                        dockerImage = docker.build "$acrregistryname" + ":$BUILD_NUMBER"
+                    }
+                }
+            }
+        }
+        
+        stage('Push the Docker Image'){
+            steps{
+                withCredentials([string(credentialsId: 'registryurl', variable: 'registryurl')]) {
+                   script{
+                        docker.withRegistry( "http://${registryurl}", registrycredential) {
+                        dockerImage.push()
+                   }
+                }
+                
+            }
+            
+        }
+            
+    }
+    
+        stage('Assign ACR Permission to AKS'){
+           steps{
+               
+               withCredentials([azureServicePrincipal(credentialsId: 'azsp',
+               subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
+               clientIdVariable: 'ARM_CLIENT_ID',
+               clientSecretVariable: 'ARM_CLIENT_SECRET',
+               tenantIdVariable: 'ARM_TENANT_ID'),string(credentialsId: 'Registryname', variable: 'acrregistryname'),string(credentialsId: 'cluster',variable:'cluster'),string(credentialsId:'resourcegroup', variable :'resourcegroup')]) {
+                    sh "az login --service-principal -u $ARM_CLIENT_ID -p $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID "
+                    sh "az aks update -n '$cluster' -g '$resourcegroup' --attach-acr $acrregistryname"
+            }
+               
+               
+           }
+        }
+        
+        stage('Deploy the code into Azure Kubernetes'){
+            steps{
+                withCredentials([azureServicePrincipal(credentialsId: 'azsp',
+               subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
+               clientIdVariable: 'ARM_CLIENT_ID',
+               clientSecretVariable: 'ARM_CLIENT_SECRET',
+               tenantIdVariable: 'ARM_TENANT_ID'),string(credentialsId: 'Registryname', variable: 'acrregistryname'),string(credentialsId:'resourcegroup', variable :'resourcegroup'),string(credentialsId:'cluster', variable:'cluster')]) {
+                    sh "az login --service-principal -u $ARM_CLIENT_ID -p $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID "
+                    sh "az aks get-credentials --resource-group $resourcegroup --name $cluster"
+                    sh 'cat pod-nodejs.yaml | sed "s/{{BUILD_NUMBER}}/$BUILD_NUMBER/g" | kubectl apply -f -'
+                    sh "kubectl apply -f pod-mongo.yaml"
+                    
+            }
+                
+            }
+        }
+        
+        
+        
+    }
+    
+    
+}
